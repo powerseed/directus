@@ -20,7 +20,7 @@ import type { Knex } from 'knex';
 import { clearSystemCache, getCache, getCacheValue, setCacheValue } from '../cache.js';
 import type { Helpers } from '../database/helpers/index.js';
 import { getHelpers } from '../database/helpers/index.js';
-import getDatabase, { getSchemaInspector } from '../database/index.js';
+import getDatabase, { getDatabaseClient, getSchemaInspector } from '../database/index.js';
 import emitter from '../emitter.js';
 import { fetchAllowedFieldMap } from '../permissions/modules/fetch-allowed-field-map/fetch-allowed-field-map.js';
 import { fetchAllowedFields } from '../permissions/modules/fetch-allowed-fields/fetch-allowed-fields.js';
@@ -349,9 +349,14 @@ export class RelationsService {
 		const nestedActionEvents: ActionEventParams[] = [];
 
 		try {
-			await transaction(this.knex, async (trx) => {
+			// CockroachDB executes schema modifications as asynchronous "online schema change jobs".
+			// Multiple DDL statements within a single transaction cause failures and performance
+			// degradation. Each operation auto-commits independently when not wrapped in a transaction.
+			const isCockroachDb = getDatabaseClient(this.knex) === 'cockroachdb';
+
+			const updateOneOperations = async (knex: Knex) => {
 				if (existingRelation.related_collection) {
-					await trx.schema.alterTable(collection, async (table) => {
+					await knex.schema.alterTable(collection, async (table) => {
 						let constraintName: string = getDefaultIndexName('foreign', collection, field);
 
 						// If the FK already exists in the DB, drop it first
@@ -384,7 +389,7 @@ export class RelationsService {
 				}
 
 				const relationsItemService = new ItemsService('directus_relations', {
-					knex: trx,
+					knex,
 					schema: this.schema,
 					// We don't set accountability here. If you have read access to certain fields, you are
 					// allowed to extract the relations regardless of permissions to directus_relations. This
@@ -412,7 +417,13 @@ export class RelationsService {
 						);
 					}
 				}
-			});
+			};
+
+			if (isCockroachDb) {
+				await updateOneOperations(this.knex);
+			} else {
+				await transaction(this.knex, (trx) => updateOneOperations(trx));
+			}
 		} finally {
 			if (runPostColumnChange) {
 				await this.helpers.schema.postColumnChange();
