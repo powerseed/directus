@@ -17,7 +17,7 @@ import type { Knex } from 'knex';
 import { cloneDeep, merge, set } from 'lodash-es';
 import { flushCaches } from '../cache.js';
 import { getHelpers } from '../database/helpers/index.js';
-import getDatabase from '../database/index.js';
+import getDatabase, { getDatabaseClient } from '../database/index.js';
 import emitter from '../emitter.js';
 import { useLogger } from '../logger/index.js';
 import { CollectionsService } from '../services/collections.js';
@@ -53,8 +53,15 @@ export async function applyDiff(
 
 	const runPostColumnChange = await helpers.schema.preColumnChange();
 
-	await transaction(database, async (trx) => {
-		const collectionsService = new CollectionsService({ knex: trx, schema });
+	// CockroachDB executes schema modifications as asynchronous "online schema change jobs" with
+	// cluster-wide backfills. Multiple DDL statements within a single transaction cause failures
+	// and severe performance degradation. Each service method already wraps its own DDL+DML in
+	// its own transaction, so bypassing the outer transaction lets each operation auto-commit
+	// independently.
+	const isCockroachDb = getDatabaseClient(database) === 'cockroachdb';
+
+	const applyDiffOperations = async (knex: Knex) => {
+		const collectionsService = new CollectionsService({ knex, schema });
 
 		const getNestedCollectionsToCreate = (currentLevelCollection: string) =>
 			snapshotDiff.collections.filter(
@@ -113,7 +120,7 @@ export async function applyDiff(
 					);
 
 					if (relations.length > 0) {
-						const relationsService = new RelationsService({ knex: trx, schema });
+						const relationsService = new RelationsService({ knex, schema });
 
 						for (const relation of relations) {
 							try {
@@ -210,8 +217,8 @@ export async function applyDiff(
 		}
 
 		let fieldsService = new FieldsService({
-			knex: trx,
-			schema: await getSchema({ database: trx, bypassCache: true }),
+			knex,
+			schema: await getSchema({ database: knex, bypassCache: true }),
 		});
 
 		for (const { collection, field, diff } of snapshotDiff.fields) {
@@ -221,8 +228,8 @@ export async function applyDiff(
 
 					// Refresh the schema
 					fieldsService = new FieldsService({
-						knex: trx,
-						schema: await getSchema({ database: trx, bypassCache: true }),
+						knex,
+						schema: await getSchema({ database: knex, bypassCache: true }),
 					});
 				} catch (err) {
 					logger.error(`Failed to create field "${collection}.${field}"`);
@@ -256,8 +263,8 @@ export async function applyDiff(
 
 					// Refresh the schema
 					fieldsService = new FieldsService({
-						knex: trx,
-						schema: await getSchema({ database: trx, bypassCache: true }),
+						knex,
+						schema: await getSchema({ database: knex, bypassCache: true }),
 					});
 				} catch (err) {
 					logger.error(`Failed to delete field "${collection}.${field}"`);
@@ -295,8 +302,8 @@ export async function applyDiff(
 		}
 
 		const relationsService = new RelationsService({
-			knex: trx,
-			schema: await getSchema({ database: trx, bypassCache: true }),
+			knex,
+			schema: await getSchema({ database: knex, bypassCache: true }),
 		});
 
 		for (const { collection, field, diff } of snapshotDiff.relations) {
@@ -351,7 +358,13 @@ export async function applyDiff(
 				}
 			}
 		}
-	});
+	};
+
+	if (isCockroachDb) {
+		await applyDiffOperations(database);
+	} else {
+		await transaction(database, (trx) => applyDiffOperations(trx));
+	}
 
 	if (runPostColumnChange) {
 		await helpers.schema.postColumnChange();

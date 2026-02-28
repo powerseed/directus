@@ -19,6 +19,7 @@ import { RelationsService } from '../services/relations.js';
 import type { Collection } from '../types/collection.js';
 import { applyDiff, isNestedMetaUpdate } from './apply-diff.js';
 import * as getSchema from './get-schema.js';
+import * as transactionModule from './transaction.js';
 
 vi.mock('../cache.js', () => ({
 	flushCaches: vi.fn(),
@@ -845,5 +846,212 @@ describe('applyDiff', () => {
 				);
 			},
 		);
+	});
+
+	describe('CockroachDB', () => {
+		let cockroachDb: MockedFunction<Knex>;
+		let cockroachTracker: Tracker;
+
+		class Client_CockroachDB extends MockClient {}
+
+		beforeEach(() => {
+			cockroachDb = vi.mocked(knex.default({ client: Client_CockroachDB }));
+			cockroachTracker = createTracker(cockroachDb);
+		});
+
+		afterEach(() => {
+			cockroachTracker.reset();
+		});
+
+		it('Does not wrap operations in an outer transaction', async () => {
+			const transactionSpy = vi.spyOn(transactionModule, 'transaction');
+
+			const currentSnapshot: Snapshot = {
+				version: 1,
+				directus: '0.0.0',
+				collections: [],
+				fields: [],
+				systemFields: [],
+				relations: [],
+			};
+
+			const snapshotDiff: SnapshotDiff = {
+				collections: [
+					{
+						collection: 'test_collection',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									meta: { group: null },
+									schema: { name: 'test_collection' },
+								} as Collection,
+							},
+						],
+					},
+				],
+				fields: [
+					{
+						collection: 'test_collection',
+						field: 'id',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									field: 'id',
+									type: 'integer',
+									meta: {},
+									schema: { is_primary_key: true },
+								} as SnapshotField,
+							},
+						],
+					},
+				],
+				systemFields: [],
+				relations: [],
+			};
+
+			vi.spyOn(CollectionsService.prototype, 'createOne').mockResolvedValue('test');
+
+			await applyDiff(currentSnapshot, snapshotDiff, {
+				database: cockroachDb,
+				schema: snapshotApplyTestSchema,
+			});
+
+			expect(transactionSpy).not.toHaveBeenCalled();
+		});
+
+		it('Still calls service methods correctly', async () => {
+			const currentSnapshot: Snapshot = {
+				version: 1,
+				directus: '0.0.0',
+				collections: [],
+				fields: [],
+				systemFields: [],
+				relations: [],
+			};
+
+			const snapshotDiff: SnapshotDiff = {
+				collections: [
+					{
+						collection: 'test_collection',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									meta: { group: null },
+									schema: { name: 'test_collection' },
+								} as Collection,
+							},
+						],
+					},
+				],
+				fields: [
+					{
+						collection: 'test_collection',
+						field: 'id',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									field: 'id',
+									type: 'integer',
+									meta: {},
+									schema: { is_primary_key: true },
+								} as SnapshotField,
+							},
+						],
+					},
+				],
+				systemFields: [],
+				relations: [],
+			};
+
+			const createOneCollectionSpy = vi.spyOn(CollectionsService.prototype, 'createOne').mockResolvedValue('test');
+
+			await applyDiff(currentSnapshot, snapshotDiff, {
+				database: cockroachDb,
+				schema: snapshotApplyTestSchema,
+			});
+
+			expect(createOneCollectionSpy).toHaveBeenCalledTimes(1);
+
+			expect(createOneCollectionSpy).toHaveBeenCalledWith(
+				expect.objectContaining({
+					collection: 'test_collection',
+					fields: expect.arrayContaining([
+						expect.objectContaining({
+							collection: 'test_collection',
+							field: 'id',
+						}),
+					]),
+				}),
+				mutationOptions,
+			);
+		});
+	});
+
+	describe('Non-CockroachDB', () => {
+		it('Wraps operations in a transaction', async () => {
+			const transactionSpy = vi.spyOn(transactionModule, 'transaction');
+
+			const currentSnapshot: Snapshot = {
+				version: 1,
+				directus: '0.0.0',
+				collections: [],
+				fields: [],
+				systemFields: [],
+				relations: [],
+			};
+
+			const snapshotDiff: SnapshotDiff = {
+				collections: [
+					{
+						collection: 'test_collection',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									meta: { group: null },
+									schema: { name: 'test_collection' },
+								} as Collection,
+							},
+						],
+					},
+				],
+				fields: [
+					{
+						collection: 'test_collection',
+						field: 'id',
+						diff: [
+							{
+								kind: DiffKind.NEW,
+								rhs: {
+									collection: 'test_collection',
+									field: 'id',
+									type: 'integer',
+									meta: {},
+									schema: { is_primary_key: true },
+								} as SnapshotField,
+							},
+						],
+					},
+				],
+				systemFields: [],
+				relations: [],
+			};
+
+			vi.spyOn(CollectionsService.prototype, 'createOne').mockResolvedValue('test');
+
+			await applyDiff(currentSnapshot, snapshotDiff, { database: db, schema: snapshotApplyTestSchema });
+
+			expect(transactionSpy).toHaveBeenCalledTimes(1);
+			expect(transactionSpy).toHaveBeenCalledWith(db, expect.any(Function));
+		});
 	});
 });
