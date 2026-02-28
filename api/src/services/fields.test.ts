@@ -5,6 +5,7 @@ import type { Accountability, Field, RawField } from '@directus/types';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import * as cacheModule from '../cache.js';
 import { fetchPermissions } from '../permissions/lib/fetch-permissions.js';
+import { getDatabaseClient } from '../database/index.js';
 import {
 	createMockKnex,
 	createMockTableBuilder,
@@ -780,6 +781,29 @@ describe('Integration Tests', () => {
 				await service.deleteField('test_collection', 'name');
 
 				expect(clearSpy).toHaveBeenCalled();
+			});
+
+			test('should bypass outer transaction for CockroachDB', async () => {
+				vi.mocked(getDatabaseClient).mockReturnValueOnce('cockroachdb');
+
+				const service = new FieldsService({
+					knex: db,
+					schema,
+					accountability: null,
+				});
+
+				// Override default empty response with specific field data
+				tracker.on.select('directus_fields').response([{ collection: 'test_collection', field: 'name' }]);
+				// Mock any DDL queries
+				tracker.on.any(/alter table/i).response([]);
+
+				const deleteByQuerySpy = vi.spyOn(ItemsService.prototype, 'deleteByQuery').mockResolvedValue([]);
+
+				db.schema.table = mockSchemaTable() as any;
+
+				await service.deleteField('test_collection', 'name');
+
+				expect(deleteByQuerySpy).toHaveBeenCalled();
 			});
 		});
 

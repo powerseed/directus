@@ -31,7 +31,7 @@ import { ALIAS_TYPES, ALLOWED_DB_DEFAULT_FUNCTIONS } from '../constants.js';
 import { translateDatabaseError } from '../database/errors/translate.js';
 import type { Helpers } from '../database/helpers/index.js';
 import { getHelpers } from '../database/helpers/index.js';
-import getDatabase, { getSchemaInspector } from '../database/index.js';
+import getDatabase, { getDatabaseClient, getSchemaInspector } from '../database/index.js';
 import emitter from '../emitter.js';
 import { fetchPermissions } from '../permissions/lib/fetch-permissions.js';
 import { fetchPolicies } from '../permissions/lib/fetch-policies.js';
@@ -718,17 +718,23 @@ export class FieldsService {
 				);
 			}
 
-			await transaction(this.knex, async (trx) => {
+			// CockroachDB executes schema modifications as asynchronous "online schema change jobs".
+			// Multiple DDL statements within a single transaction cause failures and performance
+			// degradation. Each service method already wraps its own DDL+DML in its own transaction,
+			// so bypassing the outer transaction lets each operation auto-commit independently.
+			const isCockroachDb = getDatabaseClient(this.knex) === 'cockroachdb';
+
+			const deleteFieldOperations = async (knex: Knex) => {
 				const relations = getRelations(this.schema.relations, collection, field);
 
 				const relationsService = new RelationsService({
-					knex: trx,
+					knex,
 					accountability: this.accountability,
 					schema: this.schema,
 				});
 
 				const fieldsService = new FieldsService({
-					knex: trx,
+					knex,
 					accountability: this.accountability,
 					schema: this.schema,
 				});
@@ -761,7 +767,7 @@ export class FieldsService {
 
 					// If the current field is a o2m, just delete the one field config from the relation
 					if (!isM2O && relation.meta?.one_field) {
-						await trx('directus_relations')
+						await knex('directus_relations')
 							.update({ one_field: null })
 							.where({ many_collection: relation.collection, many_field: relation.field });
 					}
@@ -773,7 +779,7 @@ export class FieldsService {
 					field in this.schema.collections[collection]!.fields &&
 					this.schema.collections[collection]!.fields[field]!.alias === false
 				) {
-					await trx.schema.table(collection, (table) => {
+					await knex.schema.table(collection, (table) => {
 						table.dropColumn(field);
 					});
 				}
@@ -784,7 +790,7 @@ export class FieldsService {
 
 				const collectionRelationList = getCollectionRelationList(collection, collectionRelationTree);
 
-				const collectionMetaQuery = trx
+				const collectionMetaQuery = knex
 					.queryBuilder()
 					.select('collection', 'archive_field', 'sort_field', 'item_duplication_fields')
 					.from('directus_collections')
@@ -807,11 +813,11 @@ export class FieldsService {
 				);
 
 				for (const meta of collectionMetaUpdates) {
-					await trx('directus_collections').update(meta.updates).where({ collection: meta.collection });
+					await knex('directus_collections').update(meta.updates).where({ collection: meta.collection });
 				}
 
 				// Cleanup directus_fields
-				const metaRow = await trx
+				const metaRow = await knex
 					.select('collection', 'field')
 					.from('directus_fields')
 					.where({ collection, field })
@@ -819,13 +825,13 @@ export class FieldsService {
 
 				if (metaRow) {
 					// Handle recursive FK constraints
-					await trx('directus_fields')
+					await knex('directus_fields')
 						.update({ group: null })
 						.where({ group: metaRow.field, collection: metaRow.collection });
 				}
 
 				const itemsService = new ItemsService('directus_fields', {
-					knex: trx,
+					knex,
 					accountability: this.accountability,
 					schema: this.schema,
 				});
@@ -841,7 +847,7 @@ export class FieldsService {
 				);
 
 				// cleanup permissions for deleted field
-				const permissionRows: { id: number; collection: string; fields: string }[] = await trx
+				const permissionRows: { id: number; collection: string; fields: string }[] = await knex
 					.select('id', 'collection', 'fields')
 					.from('directus_permissions')
 					.whereRaw('?? = ? AND ?? LIKE ?', ['collection', collection, 'fields', '%' + field + '%']);
@@ -853,12 +859,18 @@ export class FieldsService {
 							.filter((v) => v !== field)
 							.join(',');
 
-						await trx('directus_permissions')
+						await knex('directus_permissions')
 							.update('fields', newFields.length > 0 ? newFields : null)
 							.where('id', '=', permissionRow['id']);
 					}
 				}
-			});
+			};
+
+			if (isCockroachDb) {
+				await deleteFieldOperations(this.knex);
+			} else {
+				await transaction(this.knex, (trx) => deleteFieldOperations(trx));
+			}
 
 			const actionEvent = {
 				event: 'fields.delete',
