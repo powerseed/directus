@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, type MockedFunction, vi } 
 import { snapshotApplyTestSchema } from '../__utils__/schemas.js';
 import { CollectionsService } from '../services/collections.js';
 import { FieldsService } from '../services/fields.js';
+import { ItemsService } from '../services/items.js';
 import { RelationsService } from '../services/relations.js';
 import type { Collection } from '../types/collection.js';
 import { applyDiff, isNestedMetaUpdate } from './apply-diff.js';
@@ -372,20 +373,31 @@ describe('applyDiff', () => {
 				relations: [],
 			};
 
-			const createFieldSpy = vi.spyOn(FieldsService.prototype, 'createField').mockResolvedValue();
+			const addColumnSpy = vi
+				.spyOn(FieldsService.prototype, 'addColumnToTable')
+				.mockImplementation(() => undefined);
+
+			const itemsCreateOneSpy = vi
+				.spyOn(ItemsService.prototype, 'createOne')
+				.mockResolvedValue('test');
+
+			tracker.on
+				.select('select max("sort") as "max" from "directus_fields"')
+				.response({ max: null });
 
 			await applyDiff(currentSnapshot, snapshotDiff, { database: db, schema: snapshotApplyTestSchema });
 
-			expect(createFieldSpy).toHaveBeenCalledTimes(1);
+			expect(addColumnSpy).toHaveBeenCalledTimes(1);
 
-			expect(createFieldSpy).toHaveBeenCalledWith(
-				'test_collection',
+			expect(itemsCreateOneSpy).toHaveBeenCalledTimes(1);
+
+			expect(itemsCreateOneSpy).toHaveBeenCalledWith(
 				expect.objectContaining({
+					collection: 'test_collection',
 					field: 'new_field',
-					type: 'string',
+					sort: 1,
 				}),
-				undefined,
-				mutationOptions,
+				{ emitEvents: false },
 			);
 		});
 
@@ -848,6 +860,117 @@ describe('applyDiff', () => {
 		);
 	});
 
+	it('Batches new fields for existing collections into single ALTER TABLE', async () => {
+		const currentSnapshot: Snapshot = {
+			version: 1,
+			directus: '0.0.0',
+			collections: [
+				{
+					collection: 'test_table',
+					meta: { group: null },
+					schema: { name: 'test_table' },
+				} as SnapshotCollection,
+			],
+			fields: [
+				{
+					collection: 'test_table',
+					field: 'id',
+					type: 'uuid',
+					meta: {},
+					schema: { is_primary_key: true },
+				} as SnapshotField,
+			],
+			systemFields: [],
+			relations: [],
+		};
+
+		const snapshotDiff: SnapshotDiff = {
+			collections: [],
+			fields: [
+				{
+					collection: 'test_table',
+					field: 'name',
+					diff: [
+						{
+							kind: DiffKind.NEW,
+							rhs: {
+								collection: 'test_table',
+								field: 'name',
+								type: 'string',
+								meta: { special: null },
+								schema: {},
+							} as SnapshotField,
+						},
+					],
+				},
+				{
+					collection: 'test_table',
+					field: 'description',
+					diff: [
+						{
+							kind: DiffKind.NEW,
+							rhs: {
+								collection: 'test_table',
+								field: 'description',
+								type: 'text',
+								meta: { special: null },
+								schema: {},
+							} as SnapshotField,
+						},
+					],
+				},
+			],
+			systemFields: [],
+			relations: [],
+		};
+
+		const addColumnSpy = vi
+			.spyOn(FieldsService.prototype, 'addColumnToTable')
+			.mockImplementation(() => undefined);
+
+		const createFieldSpy = vi.spyOn(FieldsService.prototype, 'createField').mockResolvedValue();
+
+		const itemsCreateOneSpy = vi
+			.spyOn(ItemsService.prototype, 'createOne')
+			.mockResolvedValue('test');
+
+		tracker.on
+			.select('select max("sort") as "max" from "directus_fields"')
+			.response({ max: 2 });
+
+		await applyDiff(currentSnapshot, snapshotDiff, {
+			database: db,
+			schema: snapshotApplyTestSchema,
+		});
+
+		// addColumnToTable should be called for each new field (batched)
+		expect(addColumnSpy).toHaveBeenCalledTimes(2);
+
+		// createField should NOT be called (batched path bypasses it)
+		expect(createFieldSpy).not.toHaveBeenCalled();
+
+		// Metadata rows should be inserted via ItemsService
+		expect(itemsCreateOneSpy).toHaveBeenCalledTimes(2);
+
+		expect(itemsCreateOneSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				collection: 'test_table',
+				field: 'name',
+				sort: 3,
+			}),
+			{ emitEvents: false },
+		);
+
+		expect(itemsCreateOneSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				collection: 'test_table',
+				field: 'description',
+				sort: 4,
+			}),
+			{ emitEvents: false },
+		);
+	});
+
 	describe('CockroachDB', () => {
 		let cockroachDb: MockedFunction<Knex>;
 		let cockroachTracker: Tracker;
@@ -993,6 +1116,7 @@ describe('applyDiff', () => {
 				mutationOptions,
 			);
 		});
+
 	});
 
 	describe('Non-CockroachDB', () => {

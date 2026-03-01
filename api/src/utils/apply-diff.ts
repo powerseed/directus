@@ -22,6 +22,7 @@ import emitter from '../emitter.js';
 import { useLogger } from '../logger/index.js';
 import { CollectionsService } from '../services/collections.js';
 import { FieldsService } from '../services/fields.js';
+import { ItemsService } from '../services/items.js';
 import { RelationsService } from '../services/relations.js';
 import type { Collection } from '../types/index.js';
 import { transaction } from '../utils/transaction.js';
@@ -163,22 +164,33 @@ export async function applyDiff(
 			// Check if parent collection already exists in schema
 			const parentExists = currentSnapshot.collections.find((c) => c.collection === groupName) !== undefined;
 
-			// If this is a new collection and the parent collection doesn't exist in current schema ->
-			// Check if the parent collection will be created as part of applying this snapshot ->
-			// If yes -> this collection will be created recursively
-			// If not -> create now
-			// (ex.)
-			// TopLevelCollection - I exist in current schema
-			// 		NestedCollection - I exist in snapshotDiff as a new collection
-			//			TheCurrentCollectionInIteration - I exist in snapshotDiff as a new collection but will be created as part of NestedCollection
-			const parentWillBeCreatedInThisApply =
-				snapshotDiff.collections.filter(
-					({ collection, diff }) => diff[0]?.kind === DiffKind.NEW && collection === groupName,
-				).length > 0;
+			if (parentExists) {
+				// If this is a new collection (isNewCollection == true) and the parent collection already exists in current schema (parentExists == true) ->
+				// Check if the parent collection will be created as part of applying this snapshot ->
+				// If yes -> this collection will be created recursively
+				// If not -> create now
+				// (ex.)
+				// TopLevelCollection - I exist in current schema
+				// 		NestedCollection - I exist in snapshotDiff as a new collection
+				//			TheCurrentCollectionInIteration - I exist in snapshotDiff as a new collection but will be created as part of NestedCollection
+				const parentWillBeCreatedInThisApply =
+					snapshotDiff.collections.filter(
+						({ collection, diff }) => diff[0]?.kind === DiffKind.NEW && collection === groupName,
+					).length > 0;
 
-			// Has group, but parent is not new, parent is also not being created in this snapshot apply
-			if (parentExists && !parentWillBeCreatedInThisApply) return true;
+				// Has group, but parent already exists, and parent is not being created in this snapshot apply, then create this new child collection now.
+				if (!parentWillBeCreatedInThisApply) {
+					return true;
+				}
+			}
 
+			// Has group, there are 3 possible scenarios:
+			// (1) parent doesn't exist, and will be created in this apply.
+			// (2) parent doesn't exist, and will NOT be created in this apply.
+			// (3) parent exists and will be created in this apply.
+			// Among them, only (1) is correct;
+			// (2) will lead to this new collection being ignored and won't be created;
+			// (3) will lead to an error and abort the execution.
 			return false;
 		};
 
@@ -221,22 +233,82 @@ export async function applyDiff(
 			schema: await getSchema({ database: knex, bypassCache: true }),
 		});
 
-		for (const { collection, field, diff } of snapshotDiff.fields) {
-			if (diff?.[0]?.kind === DiffKind.NEW && !isNestedMetaUpdate(diff?.[0])) {
-				try {
-					await fieldsService.createField(collection, (diff[0] as DiffNew<Field>).rhs, undefined, mutationOptions);
+		// Separate new field diffs from edit/delete diffs
+		const newFieldDiffs: typeof snapshotDiff.fields = [];
+		const otherFieldDiffs: typeof snapshotDiff.fields = [];
 
-					// Refresh the schema
-					fieldsService = new FieldsService({
-						knex,
-						schema: await getSchema({ database: knex, bypassCache: true }),
-					});
-				} catch (err) {
-					logger.error(`Failed to create field "${collection}.${field}"`);
-					throw err;
-				}
+		for (const fieldDiff of snapshotDiff.fields) {
+			if (fieldDiff.diff?.[0]?.kind === DiffKind.NEW && !isNestedMetaUpdate(fieldDiff.diff[0])) {
+				newFieldDiffs.push(fieldDiff);
+			} else {
+				otherFieldDiffs.push(fieldDiff);
 			}
+		}
 
+		// Group new fields by collection and batch create: one ALTER TABLE per collection
+		const newFieldsByCollection = new Map<string, typeof newFieldDiffs>();
+
+		for (const fieldDiff of newFieldDiffs) {
+			const group = newFieldsByCollection.get(fieldDiff.collection) || [];
+			group.push(fieldDiff);
+			newFieldsByCollection.set(fieldDiff.collection, group);
+		}
+
+		for (const [collection, fieldDiffs] of newFieldsByCollection) {
+			const fields = fieldDiffs.map((fd) => (fd.diff[0] as DiffNew<Field>).rhs);
+
+			try {
+				// Single ALTER TABLE for all columns (addColumnToTable skips alias/unknown types)
+				await knex.schema.alterTable(collection, (table) => {
+					for (const field of fields) {
+						fieldsService.addColumnToTable(table, collection, field as Field);
+					}
+				});
+
+				// Insert metadata rows with computed sort values
+				const fieldItemsService = new ItemsService('directus_fields', {
+					knex,
+					accountability: null,
+					schema: fieldsService.schema,
+				});
+
+				const existingSortRecord: Record<'max', number | null> | undefined = await knex
+					.from('directus_fields')
+					.where({ collection })
+					.max('sort', { as: 'max' })
+					.first();
+
+				let sortValue: number = existingSortRecord?.max ? Number(existingSortRecord.max) + 1 : 1;
+
+				for (const field of fields) {
+					if (field.meta) {
+						await fieldItemsService.createOne(
+							{
+								...field.meta,
+								collection,
+								field: field.field,
+								sort: sortValue++,
+							},
+							{ emitEvents: false },
+						);
+					}
+				}
+			} catch (err) {
+				logger.error(`Failed to batch create fields for collection "${collection}"`);
+				throw err;
+			}
+		}
+
+		// One schema refresh after all batched new fields
+		if (newFieldDiffs.length > 0) {
+			fieldsService = new FieldsService({
+				knex,
+				schema: await getSchema({ database: knex, bypassCache: true }),
+			});
+		}
+
+		// Process EDIT/DELETE fields individually
+		for (const { collection, field, diff } of otherFieldDiffs) {
 			if (diff?.[0]?.kind === DiffKind.EDIT || diff?.[0]?.kind === DiffKind.ARRAY || isNestedMetaUpdate(diff[0]!)) {
 				const currentField = currentSnapshot.fields.find((snapshotField) => {
 					return snapshotField.collection === collection && snapshotField.field === field;
